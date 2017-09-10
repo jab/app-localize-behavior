@@ -52,6 +52,33 @@ subject to an additional IP rights grant found at http://polymer.github.io/PATEN
 *        &lt;/script>
 *     </dom-module>
 *
+*
+* If the resources stored in your external file are for a single language and
+* so are not nested inside any language keys, you can pass an optional
+* `language` parameter to store the fetched resources inside that key.
+* This complements the optional third parameter, `merge`, nicely: If you pass
+* `merge = true`, the fetched resources will be merged into any existing
+* resources rather than clobbering them. Object.assign is used for the merge,
+* but you can also pass your own merge function to use that instead.
+* Finally, if you pass an optional fourth parameter, `preprocessor`, that
+* function will be called on the loaded data and the result will be used
+* instead of the raw data.
+*
+* Example:
+*
+*     attached: function() {
+*       this.loadResources(
+*
+*         // Only contains the flattened "es" translations:
+*         'locales/es.json',  // {"hi": "hola"}
+*
+*         'es',               // unflatten -> {"es": {"hi": "hola"}}
+*
+*         true                // existing {"en": {...}} resources won't be clobbered
+*       );
+*     }
+*
+*
 * Alternatively, you can also inline your resources inside the app itself:
 *
 *     <dom-module id="x-app">
@@ -107,6 +134,71 @@ Polymer.AppLocalizeBehavior = {
    *
    * @event app-localize-resources-error
    */
+
+  /**
+   * Helper function to choose the most preferred language from a set of
+   * available languages. Supply an `available` function, that takes a
+   * language and returns the closest variant (possibly itself) that you have
+   * available, as well as an optional list of preferred languages, ordered
+   * from most-to-least preferred. Pass an iterable instead of a function for
+   * `available` and a corresponding lookup function will be created using
+   * `makeLookUpLanguage` and used. If no preferred languages are given, the
+   * browser language preferences are inferred via the `navigator` object.
+   *
+   * For example, if your app is available in 'en-CA' and 'fr-CA', and the
+   * user's browser is set to prefer ['es-ES', 'fr-FR', 'en-GB'], you could
+   * do the following in order to calculate that 'fr-CA' is the best language
+   * that you have available for this user:
+   *
+   *     var AVAILABLE = ['en-CA', 'fr-CA'];
+   *     navigator.languages;           // -> ['es-ES', 'fr-FR', 'en-GB']
+   *     negotiateLanguage(AVAILABLE);  // -> 'fr-CA'
+   *
+   */
+  negotiateLanguage: function(available, preferred) {
+    available = typeof available === 'function' ? available : this.makeLookUpLanguage(available);
+    preferred = preferred || navigator.languages ||
+        [navigator.language || navigator.browserLanguage];
+    for (var i = 0; i < preferred.length; i++) {
+      var candidate = preferred[i];
+      var parts = candidate.split('-');
+      while (parts.length) {
+        var joined = parts.join('-');
+        var closest = available(joined);
+        if (closest) {
+          return closest;
+        }
+        parts.pop();
+      }
+    }
+  },
+
+  /**
+   * Helper function that makes a lookUpLanguage function that can be passed
+   * to `negotiateLanguage`.
+   *
+   * Takes an iterable of available languages, and optionally a `normalize`
+   * function called on the available language keys (defaulting to
+   * `String.prototype.toLowerCase` if not given), and returns a function
+   * that returns the closest available language to the one given.
+   */
+  makeLookUpLanguage: function(availableLanguages, normalize) {
+    normalize = normalize || String.prototype.toLowerCase.call.bind(
+        String.prototype.toLowerCase);
+    return function(language) {
+      language = normalize(language);
+      for (var availableLanguage of availableLanguages) {
+        var parts = normalize(availableLanguage).split('-');
+        while (parts.length) {
+          var joined = parts.join('-');
+          if (language === joined) {
+            return availableLanguage;
+          }
+          parts.pop();
+        }
+      }
+    };
+  },
 
   properties: {
     /**
@@ -172,7 +264,7 @@ Polymer.AppLocalizeBehavior = {
     }
   },
 
-  loadResources: function(path) {
+  loadResources: function(path, language, merge, preprocessor) {
     var proto = this.constructor.prototype;
 
     // Check if localCache exist just in case.
@@ -185,19 +277,24 @@ Polymer.AppLocalizeBehavior = {
     }
 
     var request = proto.__localizationCache.requests[path];
+
+    function onRequestResponse(event) {
+      this.__onRequestResponse(event, language, merge, preprocessor);
+    }
+
     if (!request) {
       ajax.url = path;
       var request = ajax.generateRequest();
 
       request.completes.then(
-          this.__onRequestResponse.bind(this),
+          onRequestResponse.bind(this),
           this.__onRequestError.bind(this));
 
       // Cache the instance so that it can be reused if the same path is loaded.
       proto.__localizationCache.requests[path] = request;
     } else {
       request.completes.then(
-          this.__onRequestResponse.bind(this),
+          onRequestResponse.bind(this),
           this.__onRequestError.bind(this));
     }
   },
@@ -247,9 +344,35 @@ Polymer.AppLocalizeBehavior = {
     };
   },
 
-  __onRequestResponse: function(event) {
-    this.resources = event.response;
-    this.fire('app-localize-resources-loaded', event, { bubbles: this.bubbleEvent});
+  __onRequestResponse: function(event, language, merge, preprocessor) {
+    var propertyUpdates = {};
+    var newResources = preprocessor ? preprocessor(event.response) : event.response;
+    if (merge) {
+      merge = typeof merge === 'function' ? merge : Object.assign;
+      if (language) {
+        propertyUpdates.resources = merge({}, this.resources || {});
+        propertyUpdates['resources.' + language] = merge(
+          propertyUpdates.resources[language] || {}, newResources);
+      } else {
+        propertyUpdates.resources = merge(this.resources, newResources);
+      }
+    } else {
+      if (language) {
+        propertyUpdates.resources = {};
+        propertyUpdates.resources[language] = newResources;
+        propertyUpdates['resources.' + language] = newResources;
+      } else {
+        propertyUpdates.resources = newResources;
+      }
+    }
+    if (this.setProperties) {
+      this.setProperties(propertyUpdates);
+    } else {
+      for (var key in propertyUpdates) {
+        this.set(key, propertyUpdates[key]);
+      }
+    }
+    this.fire('app-localize-resources-loaded', event, {bubbles: this.bubbleEvent});
   },
 
   __onRequestError: function(event) {
